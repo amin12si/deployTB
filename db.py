@@ -23,6 +23,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             label TEXT NOT NULL,
             token_encrypted TEXT NOT NULL,
+            workspace_id TEXT,
             last_valid INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL
         );
@@ -42,6 +43,11 @@ def init_db():
         """
     )
     _db.commit()
+    # migrate older DBs created before workspace_id existed
+    cols = [r["name"] for r in _db.execute("PRAGMA table_info(accounts)").fetchall()]
+    if "workspace_id" not in cols:
+        _db.execute("ALTER TABLE accounts ADD COLUMN workspace_id TEXT")
+        _db.commit()
 
 
 def now() -> str:
@@ -50,10 +56,10 @@ def now() -> str:
 
 # ── accounts ────────────────────────────────────────────────────────────
 
-def add_account(label: str, token: str) -> int:
+def add_account(label: str, token: str, workspace_id: str | None = None) -> int:
     cur = _db.execute(
-        "INSERT INTO accounts (label, token_encrypted, last_valid, created_at) VALUES (?, ?, 1, ?)",
-        (label, crypto.encrypt(token), now()),
+        "INSERT INTO accounts (label, token_encrypted, workspace_id, last_valid, created_at) VALUES (?, ?, ?, 1, ?)",
+        (label, crypto.encrypt(token), workspace_id, now()),
     )
     _db.commit()
     return cur.lastrowid
@@ -70,6 +76,11 @@ def get_account(account_id: int):
 def get_account_token(account_id: int) -> str:
     row = get_account(account_id)
     return crypto.decrypt(row["token_encrypted"])
+
+
+def set_account_workspace_id(account_id: int, workspace_id: str | None):
+    _db.execute("UPDATE accounts SET workspace_id = ? WHERE id = ?", (workspace_id, account_id))
+    _db.commit()
 
 
 def set_account_validity(account_id: int, valid: bool):
@@ -158,8 +169,8 @@ def import_all(blob: str, wipe_existing: bool = False):
         # sanity check the token decrypts with this deploy's ENCRYPTION_KEY before committing
         crypto.decrypt(acc["token_encrypted"])
         cur = _db.execute(
-            "INSERT INTO accounts (label, token_encrypted, last_valid, created_at) VALUES (?, ?, ?, ?)",
-            (acc["label"], acc["token_encrypted"], acc["last_valid"], acc["created_at"]),
+            "INSERT INTO accounts (label, token_encrypted, workspace_id, last_valid, created_at) VALUES (?, ?, ?, ?, ?)",
+            (acc["label"], acc["token_encrypted"], acc.get("workspace_id"), acc["last_valid"], acc["created_at"]),
         )
         id_map[acc["id"]] = cur.lastrowid
 
