@@ -126,7 +126,8 @@ async def run_deploy(account_id: int, query, context: ContextTypes.DEFAULT_TYPE)
         project_name = f"vpn-panel-{secrets.token_hex(3)}"
         label = f"panel-{n}"
 
-        project_id = await client.create_project(project_name)
+        workspace_id = await client.resolve_workspace_id()
+        project_id = await client.create_project(project_name, workspace_id=workspace_id)
 
         await _edit(query, f"Deploying on {account['label']}…\n\n✅ Project created\n⏳ Creating service…")
         project = await client.get_project(project_id)
