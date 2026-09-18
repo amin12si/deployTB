@@ -38,10 +38,32 @@ class RailwayClient:
         data = await self._call("query { me { id name email } }")
         return data["me"]
 
-    async def create_project(self, name: str) -> str:
+    async def resolve_workspace_id(self) -> str | None:
+        """projectCreate now requires a workspaceId for most accounts. There's
+        no single documented field for "my default workspace", so try the
+        shapes that are known to exist and take the first workspace found."""
+        for query in (
+            "query { me { workspaces { edges { node { id name } } } } }",
+            "query { workspaces { edges { node { id name } } } }",
+        ):
+            try:
+                data = await self._call(query)
+            except RailwayAPIError:
+                continue
+            container = data.get("me", data).get("workspaces") if isinstance(data.get("me", data), dict) else None
+            if container:
+                edges = container.get("edges") or []
+                if edges:
+                    return edges[0]["node"]["id"]
+        return None
+
+    async def create_project(self, name: str, workspace_id: str | None = None) -> str:
+        input_data = {"name": name}
+        if workspace_id:
+            input_data["workspaceId"] = workspace_id
         data = await self._call(
             "mutation projectCreate($input: ProjectCreateInput!) { projectCreate(input: $input) { id } }",
-            {"input": {"name": name}},
+            {"input": input_data},
         )
         return data["projectCreate"]["id"]
 
