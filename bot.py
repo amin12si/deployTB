@@ -18,7 +18,7 @@ from railway_client import RailwayClient, RailwayAPIError
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("bot")
 
-WAITING_TOKEN, WAITING_LABEL, WAITING_IMPORT_FILE = range(3)
+WAITING_TOKEN, WAITING_WORKSPACE, WAITING_LABEL, WAITING_IMPORT_FILE, WAITING_WORKSPACE_UPDATE = range(5)
 
 
 def owner_only(fn):
@@ -126,8 +126,18 @@ async def run_deploy(account_id: int, query, context: ContextTypes.DEFAULT_TYPE)
         project_name = f"vpn-panel-{secrets.token_hex(3)}"
         label = f"panel-{n}"
 
-        workspace_id = await client.resolve_workspace_id()
-        project_id = await client.create_project(project_name, workspace_id=workspace_id)
+        workspace_id = account["workspace_id"]
+        if not workspace_id:
+            workspace_id = await client.resolve_workspace_id()  # best-effort, usually None
+        try:
+            project_id = await client.create_project(project_name, workspace_id=workspace_id)
+        except RailwayAPIError as e:
+            if "workspaceId" in str(e) or "workspace" in str(e).lower():
+                raise RailwayAPIError(
+                    f"{e} — set a Workspace ID for {account['label']} from its account detail view "
+                    "(Ctrl/Cmd+K → \"Copy Active Workspace ID\" in the Railway dashboard), then try again."
+                )
+            raise
 
         await _edit(query, f"Deploying on {account['label']}…\n\n✅ Project created\n⏳ Creating service…")
         project = await client.get_project(project_id)
@@ -246,7 +256,21 @@ async def add_account_got_token(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data["pending_token"] = token
     suggested = me.get("name") or me.get("email") or "account"
     context.user_data["pending_suggested_label"] = suggested
-    await msg.edit_text(f"✅ Valid — signed in as {suggested}.\n\nWhat should I label this account as?")
+    await msg.edit_text(
+        f"✅ Valid — signed in as {suggested}.\n\n"
+        "Railway now requires a Workspace ID to create projects on most accounts. "
+        "In the Railway dashboard, press Ctrl/Cmd+K, search \"Copy Active Workspace ID\", "
+        "and paste it here.\n\nSend \"skip\" if you're not sure — we'll try without one "
+        "and you can add it later if deploys fail."
+    )
+    return WAITING_WORKSPACE
+
+
+@owner_only
+async def add_account_got_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+    context.user_data["pending_workspace_id"] = None if raw.lower() == "skip" else raw
+    await update.message.reply_text("What should I label this account as?")
     return WAITING_LABEL
 
 
@@ -254,12 +278,38 @@ async def add_account_got_token(update: Update, context: ContextTypes.DEFAULT_TY
 async def add_account_got_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
     label = update.message.text.strip()[:64] or context.user_data.get("pending_suggested_label", "account")
     token = context.user_data.pop("pending_token", None)
+    workspace_id = context.user_data.pop("pending_workspace_id", None)
     context.user_data.pop("pending_suggested_label", None)
     if not token:
         await update.message.reply_text("Something went wrong, start over with /start.")
         return ConversationHandler.END
-    db.add_account(label, token)
-    await update.message.reply_text(f"✅ Added account: {label}", reply_markup=main_menu_kb())
+    db.add_account(label, token, workspace_id)
+    note = "" if workspace_id else "\n\n⚠️ No Workspace ID set — deploys will fail if your account requires one. Add it from the account's detail view."
+    await update.message.reply_text(f"✅ Added account: {label}{note}", reply_markup=main_menu_kb())
+    return ConversationHandler.END
+
+
+@owner_only
+async def account_set_workspace_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    account_id = int(query.data.split(":")[1])
+    context.user_data["editing_workspace_account_id"] = account_id
+    await query.edit_message_text(
+        "Paste the Workspace ID (Ctrl/Cmd+K → \"Copy Active Workspace ID\" in the Railway dashboard), or /cancel."
+    )
+    return WAITING_WORKSPACE_UPDATE
+
+
+@owner_only
+async def account_set_workspace_got(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    account_id = context.user_data.pop("editing_workspace_account_id", None)
+    if account_id is None:
+        await update.message.reply_text("Something went wrong, start over with /start.")
+        return ConversationHandler.END
+    workspace_id = update.message.text.strip()
+    db.set_account_workspace_id(account_id, workspace_id)
+    await update.message.reply_text("✅ Workspace ID updated.", reply_markup=main_menu_kb())
     return ConversationHandler.END
 
 
@@ -281,14 +331,17 @@ async def account_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     n = db.count_panels_for_account(account_id)
     status = "✅ valid" if account["last_valid"] else "⚠️ invalid/revoked (last check)"
+    ws = account["workspace_id"] or "not set"
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📦 Panels", callback_data=f"acct_panels:{account_id}")],
         [InlineKeyboardButton("❤️ Check Health", callback_data=f"acct_health:{account_id}")],
+        [InlineKeyboardButton("🏷 Set Workspace ID", callback_data=f"acct_set_ws:{account_id}")],
         [InlineKeyboardButton("🗑 Delete Account", callback_data=f"acct_delete:{account_id}")],
         [InlineKeyboardButton("⬅ Back", callback_data="accounts_menu")],
     ])
     await query.edit_message_text(
-        f"👤 {account['label']}\nStatus: {status}\nPanels: {n}/{config.MAX_PANELS_PER_ACCOUNT}\nAdded: {account['created_at'][:10]}",
+        f"👤 {account['label']}\nStatus: {status}\nWorkspace ID: {ws}\n"
+        f"Panels: {n}/{config.MAX_PANELS_PER_ACCOUNT}\nAdded: {account['created_at'][:10]}",
         reply_markup=kb,
     )
 
@@ -624,11 +677,21 @@ def main():
         entry_points=[CallbackQueryHandler(add_account_start, pattern="^add_account$")],
         states={
             WAITING_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_account_got_token)],
+            WAITING_WORKSPACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_account_got_workspace)],
             WAITING_LABEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_account_got_label)],
         },
         fallbacks=[CommandHandler("cancel", cancel_conversation)],
     )
     app.add_handler(add_account_conv)
+
+    set_workspace_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(account_set_workspace_start, pattern="^acct_set_ws:")],
+        states={
+            WAITING_WORKSPACE_UPDATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, account_set_workspace_got)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+    )
+    app.add_handler(set_workspace_conv)
 
     import_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(do_import_start, pattern="^do_import$")],
